@@ -10,30 +10,42 @@ const LOGS_GROUP = process.env.LOGS_GROUP.trim();
 const CHANNEL_LINK = process.env.CHANNEL_LINK.trim();
 const CHANNEL_IKLAN = process.env.CHANNEL_IKLAN.trim();
 
-// FIX EFATAL ERROR: Memaksa memakai IPv4 agar koneksi ke API Telegram sangat stabil
+// Koneksi stabil IPv4
 const bot = new TelegramBot(token, { 
     polling: true,
     request: { agentOptions: { family: 4 } } 
 });
 
-bot.on('polling_error', () => {}); // Menyembunyikan log polling error sepele
+bot.on('polling_error', () => {}); 
 
+// ==========================================
+// SET COMMANDS OTOMATIS
+// ==========================================
 bot.setMyCommands([
-    { command: '/start', description: 'Mulai mencari pasangan obrolan' },
-    { command: '/search', description: 'Cari pasangan baru' },
+    { command: '/start', description: 'Mulai menggunakan bot / Cari Pasangan' },
+    { command: '/search', description: 'Cari atau lewati pasangan obrolan' },
     { command: '/next', description: 'Lewati obrolan & cari yang baru' },
-    { command: '/stop', description: 'Hentikan pencarian / obrolan saat ini' },
+    { command: '/stop', description: 'Hentikan obrolan saat ini' },
     { command: '/refer', description: 'Dapatkan Premium & Link Undangan' },
     { command: '/stats', description: 'Cek statistik pengguna bot' },
+    { command: '/help', description: 'Bantuan cara menggunakan bot' },
     { command: '/ripport', description: 'Laporkan pelanggaran (Wajib balas pesan)' }
 ]);
 
+// ==========================================
+// INISIALISASI DATABASE
+// ==========================================
 const db = new sqlite3.Database('./bot.db');
 db.serialize(() => {
     db.run(`CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY, state TEXT DEFAULT 'idle', partner_id INTEGER, 
-        warnings INTEGER DEFAULT 0, ban_until INTEGER DEFAULT 0, referrals INTEGER DEFAULT 0, premium_until INTEGER DEFAULT 0
+        warnings INTEGER DEFAULT 0, ban_until INTEGER DEFAULT 0, referrals INTEGER DEFAULT 0, premium_until INTEGER DEFAULT 0,
+        gender TEXT DEFAULT NULL, age TEXT DEFAULT NULL
     )`);
+    // Pembaruan aman: Tambah kolom gender & age jika database sudah terlanjur dibuat versi lama
+    db.run(`ALTER TABLE users ADD COLUMN gender TEXT`, (err) => {});
+    db.run(`ALTER TABLE users ADD COLUMN age TEXT`, (err) => {});
+    
     db.run(`CREATE TABLE IF NOT EXISTS messages (message_id INTEGER PRIMARY KEY, sender_id INTEGER)`);
 });
 
@@ -51,13 +63,23 @@ async function isMemberJoined(userId) {
     } catch (e) { return false; }
 }
 
-async function sendBotMessage(userId, textMsg) {
+// ==========================================
+// FUNGSI PESAN SISTEM (DENGAN IKLAN)
+// ==========================================
+async function sendBotMessage(userId, textMsg, customKeyboard = null) {
     let isMember = await isMemberJoined(userId);
     let promoText = isMember ? "" : `\n\n<i>Ikuti saluran kami agar kamu tidak mendapatkan text promosi.</i>`;
-    let opts = { parse_mode: 'HTML' };
     
-    // Fitur API 9.4: Tombol Joint Berwarna Hijau
-    if (!isMember) opts.reply_markup = { inline_keyboard: [[{ text: "🚪Joint", url: CHANNEL_LINK, style: "success" }]] };
+    let inline_keyboard = customKeyboard ? [...customKeyboard] :[];
+    
+    if (!isMember) {
+        inline_keyboard.push([{ text: "🚪Joint", url: CHANNEL_LINK, style: "success" }]);
+    }
+
+    let opts = { 
+        parse_mode: 'HTML',
+        reply_markup: inline_keyboard.length > 0 ? { inline_keyboard } : undefined
+    };
     
     return bot.sendMessage(userId, textMsg + promoText, opts).catch(()=>{});
 }
@@ -80,31 +102,47 @@ function generateCaptcha() {
     return { question, result: result.toString() };
 }
 
+// ==========================================
+// PROSES CARI & PASANGKAN
+// ==========================================
 async function findPartner(userId) {
     db.get("SELECT id FROM users WHERE state = 'searching' AND id != ? LIMIT 1",[userId], async (err, partner) => {
         if (partner) {
             await updateState(userId, 'chatting', partner.id);
             await updateState(partner.id, 'chatting', userId);
-            sendBotMessage(userId, "🎉 Pasangan ditemukan! Silakan mulai mengobrol.");
-            sendBotMessage(partner.id, "🎉 Pasangan ditemukan! Silakan mulai mengobrol.");
+            
+            const matchText = `Obrolan di temukan apa yang ingin anda katakan?🤔\n\n/next — cari pasangan baru\n/stop — stop berpasangan.\n/help — bantuan menggunakan bot`;
+            sendBotMessage(userId, matchText);
+            sendBotMessage(partner.id, matchText);
         } else {
             sendBotMessage(userId, "❌Pasangan Belum Di Temukan Gunakan /refer Agar Pasangan Cepat Di Temukan Dan Akunmu Menjadi Premium");
         }
     });
 }
 
+// Fungsi Trigger Pencarian
+async function startSearch(chatId) {
+    await updateState(chatId, 'searching');
+    await sendBotMessage(chatId, "<i>🔎Sedang Mencari Pasangan...</i>");
+    findPartner(chatId);
+}
+
+// ==========================================
+// EVENT LISTENER PESAN MASUK
+// ==========================================
 bot.on('message', async (msg) => {
     const chatId = msg.chat.id;
     const text = msg.text || '';
 
     let user = await getUser(chatId);
     let isNewUser = false;
+    
     if (!user) {
-        db.run("INSERT INTO users (id) VALUES (?)", [chatId]);
-        user = { id: chatId, state: 'idle', warnings: 0, ban_until: 0, referrals: 0, premium_until: 0 };
+        db.run("INSERT INTO users (id) VALUES (?)",[chatId]);
+        user = { id: chatId, state: 'idle', warnings: 0, ban_until: 0, referrals: 0, premium_until: 0, gender: null, age: null };
         isNewUser = true;
         
-        // PANTUAN GRUP LOGS: Info pengguna baru
+        // Lapor ke Logs Group
         bot.sendMessage(LOGS_GROUP, `🚀 <b>PENGGUNA BARU</b>\nID: <code>${chatId}</code> baru saja memulai bot!`, { parse_mode: 'HTML' }).catch(()=>{});
     }
 
@@ -119,41 +157,68 @@ bot.on('message', async (msg) => {
         return;
     }
 
-    if (text.startsWith('/start') || text.startsWith('/search')) {
+    if (text === '/help') {
+        const helpText = `📚 <b>BANTUAN & CARA MENGGUNAKAN BOT</b>\n\n` +
+        `Bot ini dirancang untuk menghubungkan Anda dengan orang asing secara anonim. Identitas Anda aman dan pesan Anda dienkripsi oleh sistem Telegram.\n\n` +
+        `🛠 <b>DAFTAR PERINTAH UTAMA:</b>\n` +
+        `🔹 /start - Mendaftarkan identitas (bagi pengguna baru) atau memulai mencari pasangan obrolan.\n` +
+        `🔹 /search - Langsung melewati (skip) obrolan saat ini dan mencari teman baru.\n` +
+        `🔹 /next - Berfungsi sama seperti /search.\n` +
+        `🔹 /stop - Berhenti mencari atau mengakhiri obrolan saat ini dan kembali ke menu awal.\n\n` +
+        `💎 <b>FITUR PREMIUM:</b>\n` +
+        `🔹 /refer - Dapatkan tautan undangan Anda. Undang teman dan dapatkan <b>Premium Gratis</b> agar Anda bebas mengirim tanda baca dan Link tanpa dihalangi sistem Keamanan Anti-Spam (Matematika).\n\n` +
+        `⚖️ <b>SISTEM LAPORAN:</b>\n` +
+        `🔹 /ripport - Balas (Reply) chat yang melanggar/mengganggu, ketik /ripport. Admin akan menindak tegas pelanggar berupa blokir Permanen.\n\n` +
+        `<i>Tips: Tetap jaga etika dalam mengobrol dan jangan membagikan data pribadi sembarangan!</i>`;
+        
+        return sendBotMessage(chatId, helpText);
+    }
+
+    // ==========================================
+    // LOGIKA START & ONBOARDING IDENTITAS
+    // ==========================================
+    if (text.startsWith('/start')) {
         let refId = text.split(' ')[1];
+        
+        // Proses Referral jika user baru
         if (refId && refId != chatId && isNewUser) {
             let referrer = await getUser(refId);
             if (referrer) {
                 let newRef = referrer.referrals + 1;
                 let addDays = (newRef === 1) ? 1 : (newRef === 7) ? 7 : (newRef === 30) ? 30 : (newRef === 400) ? 365 : 0;
-
                 if (addDays > 0) {
                     let premUntil = (referrer.premium_until > Date.now() ? referrer.premium_until : Date.now()) + (addDays * 24 * 60 * 60 * 1000);
                     db.run("UPDATE users SET referrals = ?, premium_until = ? WHERE id = ?",[newRef, premUntil, refId]);
                 } else {
-                    db.run("UPDATE users SET referrals = ? WHERE id = ?", [newRef, refId]);
+                    db.run("UPDATE users SET referrals = ? WHERE id = ?",[newRef, refId]);
                 }
                 sendBotMessage(refId, `🎉 Kamu mendapatkan refferal baru! Total refferal: ${newRef}`);
             }
         }
+
+        // Cek Identitas
+        if (!user.gender || !user.age) {
+            return bot.sendMessage(chatId, "👩‍❤️‍💋‍👨Mengatur identitas anda sebagai pengguna", {
+                reply_markup: { inline_keyboard: [[{ text: "Jenis Kelamin", callback_data: "set_gender", style: "primary" }]] }
+            }).catch(()=>{});
+        }
+
+        // Jika sudah punya identitas
         if (user.state === 'chatting') return sendBotMessage(chatId, "⚠️ Kamu sedang mengobrol. Ketik /stop atau /next.");
-        await updateState(chatId, 'searching');
-        sendBotMessage(chatId, "🔎Sedang Mencari Pasangan...");
-        findPartner(chatId);
-        return;
+        return startSearch(chatId);
     }
 
-    if (text === '/next') {
+    // ==========================================
+    // LOGIKA NEXT & SEARCH
+    // ==========================================
+    if (text === '/next' || text === '/search') {
         if (user.state === 'chatting' && user.partner_id) {
-            sendBotMessage(user.partner_id, "❌User Baru Saja Klik /next");
+            sendBotMessage(user.partner_id, "❌Pasangan Melewatkan Obrolan Ini.");
             await updateState(user.partner_id, 'idle');
         }
         await sendBotMessage(chatId, "✅Kamu Melewatkan Obrolan Ini.");
         bot.sendChatAction(chatId, 'typing').catch(()=>{}); 
-        await sendBotMessage(chatId, "🔎Mencari Obrolan Baru...");
-        await updateState(chatId, 'searching');
-        findPartner(chatId);
-        return;
+        return startSearch(chatId);
     }
 
     if (text === '/stop') {
@@ -202,16 +267,12 @@ Kekurangan: <b>${target !== "Max" ? `Butuh ${target} referral lagi untuk level $
 <code>${refLink}</code>`);
     }
 
-    // ==========================================
-    // RIPPORT DIALIHKAN KE PRIVATE MESSAGE OWNER
-    // ==========================================
     if (text === '/ripport') {
         if (!msg.reply_to_message) return sendBotMessage(chatId, "⚠️Wajib Reply Pesan User yang ingin di-report.");
         const reportedMsgId = msg.reply_to_message.message_id;
         const suspectId = await getSenderFromCache(reportedMsgId);
         if (!suspectId) return sendBotMessage(chatId, "❌ Pesan ini tidak dapat dilaporkan.");
 
-        // KIRIM LAPORAN KE PM OWNER
         bot.sendMessage(OWNER_ID, `⚠️ <b>LAPORAN PENGGUNA</b>\n\nPelapor: <code>${chatId}</code>\nTersangka: <code>${suspectId}</code>\nPesan: ${msg.reply_to_message.text || "Media/Stiker"}`, {
             parse_mode: 'HTML',
             reply_markup: { inline_keyboard: [[
@@ -221,21 +282,21 @@ Kekurangan: <b>${target !== "Max" ? `Butuh ${target} referral lagi untuk level $
         }).then(() => {
             sendBotMessage(chatId, "✅ Laporan berhasil dikirim secara rahasia ke Admin.");
         }).catch((err) => {
-            // JIKA OWNER BELUM START BOT, INFO MASUK KE GRUP LOGS
-            bot.sendMessage(LOGS_GROUP, `⚠️ <b>ERROR REPORT:</b> Gagal mengirim laporan /ripport ke PM Owner (ID: ${OWNER_ID}).\nPastikan Owner sudah mengetik /start di bot secara langsung!`).catch(()=>{});
+            bot.sendMessage(LOGS_GROUP, `⚠️ <b>ERROR REPORT:</b> Gagal mengirim laporan /ripport ke PM Owner. Pastikan Owner sudah mengetik /start di bot secara langsung!`).catch(()=>{});
             sendBotMessage(chatId, "❌ Gagal mengirim laporan ke Admin.");
         });
         return;
     }
 
+    // ==========================================
+    // SISTEM PENGIRIMAN PESAN & CAPTCHA ANTI-SPAM
+    // ==========================================
     if (user.state === 'chatting' && user.partner_id) {
         const isPremium = user.premium_until > Date.now();
         const spamRegex = /[@.,!]|https?:\/\/|t\.me|\.com|\.id|\.net|\.org/i;
         
         if (!isPremium && text && spamRegex.test(text)) {
             const captcha = generateCaptcha();
-            
-            // TOMBOL CAPTCHA BERWARNA BIRU (primary)
             const opts = {
                 parse_mode: 'HTML',
                 reply_markup: {
@@ -267,13 +328,56 @@ Kekurangan: <b>${target !== "Max" ? `Butuh ${target} referral lagi untuk level $
 });
 
 // ==========================================
-// CALLBACK QUERY (TOMBOL ADMIN & CAPTCHA)
+// CALLBACK QUERY (TOMBOL INLINE)
 // ==========================================
 bot.on('callback_query', async (query) => {
     const data = query.data;
     const queryChatId = query.message.chat.id;
     const msgId = query.message.message_id;
 
+    // --- LOGIKA ONBOARDING START ---
+    if (data === 'set_gender') {
+        return bot.editMessageText("Atur Jenis Kelamin Kamu", {
+            chat_id: queryChatId, message_id: msgId,
+            reply_markup: { inline_keyboard: [[
+                { text: "♂️Pria", callback_data: "gender_Pria", style: "primary" },
+                { text: "♀️Wanita", callback_data: "gender_Wanita", style: "danger" }
+            ]]}
+        }).catch(()=>{});
+    }
+
+    if (data.startsWith('gender_')) {
+        let gender = data.split('_')[1];
+        db.run("UPDATE users SET gender = ? WHERE id = ?", [gender, queryChatId]);
+        
+        let ageKeyboard = [[
+                { text: "16", callback_data: "age_16", style: "danger" },
+                { text: "17", callback_data: "age_17", style: "success" },
+                { text: "18", callback_data: "age_18", style: "danger" },
+                { text: "19", callback_data: "age_19", style: "success" }
+            ],[
+                { text: "20", callback_data: "age_20", style: "success" },
+                { text: "21", callback_data: "age_21", style: "danger" },
+                { text: "22", callback_data: "age_22", style: "success" },
+                { text: "23+", callback_data: "age_23+", style: "danger" }
+            ]
+        ];
+        
+        return bot.editMessageText("Masukan Usia Kamu", {
+            chat_id: queryChatId, message_id: msgId,
+            reply_markup: { inline_keyboard: ageKeyboard }
+        }).catch(()=>{});
+    }
+
+    if (data.startsWith('age_')) {
+        let age = data.split('_')[1];
+        db.run("UPDATE users SET age = ? WHERE id = ?", [age, queryChatId]);
+        
+        await bot.editMessageText("✅ Identitas berhasil disimpan!", { chat_id: queryChatId, message_id: msgId }).catch(()=>{});
+        return startSearch(queryChatId);
+    }
+
+    // --- LOGIKA JAWABAN CAPTCHA ---
     if (data.startsWith('cpt_')) {
         const answer = data.split('_')[1];
         const captchaData = pendingCaptchas.get(msgId);
@@ -294,6 +398,7 @@ bot.on('callback_query', async (query) => {
         return;
     }
 
+    // --- LOGIKA TOMBOL ADMIN RIPPORT ---
     if (data.startsWith('acc_') || data.startsWith('rej_')) {
         const suspectId = data.split('_')[1];
         if (data.startsWith('rej_')) return bot.editMessageText(query.message.text + "\n\n❌ Laporan di Reject.", { chat_id: queryChatId, message_id: msgId }).catch(()=>{});
@@ -317,6 +422,9 @@ bot.on('callback_query', async (query) => {
     }
 });
 
+// ==========================================
+// CRON JOB & GITHUB PUSH
+// ==========================================
 cron.schedule('0 0 * * *', () => {
     db.run("DELETE FROM messages");
     exec('git add bot.db && git commit -m "Auto backup database harian" && git push origin main', (error) => {
