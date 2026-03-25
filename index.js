@@ -4,6 +4,7 @@ const sqlite3 = require('sqlite3').verbose();
 const cron = require('node-cron');
 const { exec } = require('child_process');
 
+// Mengambil Data dari .env
 const token = process.env.BOT_TOKEN;
 const OWNER_ID = Number(process.env.OWNER_ID);
 const LOGS_GROUP = Number(process.env.LOGS_GROUP);
@@ -12,15 +13,20 @@ const CHANNEL_IKLAN = Number(process.env.CHANNEL_IKLAN);
 
 const bot = new TelegramBot(token, { polling: true });
 
+// ==========================================
+// OTOMATIS SET COMMAND DI MENU TELEGRAM
+// ==========================================
 bot.setMyCommands([
     { command: '/start', description: 'Mulai mencari pasangan obrolan' },
     { command: '/search', description: 'Cari pasangan baru' },
     { command: '/next', description: 'Lewati obrolan & cari yang baru' },
-    { command: '/stop', description: 'Hentikan pencarian' },
+    { command: '/stop', description: 'Hentikan pencarian / obrolan saat ini' },
     { command: '/refer', description: 'Dapatkan link undangan (Fitur Premium)' },
-    { command: '/ripport', description: 'Laporkan pelanggaran' }
-]);
+    { command: '/stats', description: 'Cek statistik pengguna bot' },
+    { command: '/ripport', description: 'Laporkan pelanggaran (Wajib balas pesan)' }
+]).then(() => console.log("✅ Menu Commands terpasang!")).catch(console.error);
 
+// Inisialisasi Database SQLite3
 const db = new sqlite3.Database('./bot.db');
 
 db.serialize(() => {
@@ -31,56 +37,67 @@ db.serialize(() => {
     db.run(`CREATE TABLE IF NOT EXISTS messages (message_id INTEGER PRIMARY KEY, sender_id INTEGER)`);
 });
 
-const getUser = (id) => new Promise((resolve) => db.get("SELECT * FROM users WHERE id = ?",[id], (err, row) => resolve(row)));
-const updateState = (id, state, partner = null) => new Promise((resolve) => db.run(`UPDATE users SET state = ?, partner_id = ? WHERE id = ?`,[state, partner, id], resolve));
-const addMessageCache = (msgId, senderId) => db.run("INSERT OR REPLACE INTO messages (message_id, sender_id) VALUES (?, ?)", [msgId, senderId]);
-const getSenderFromCache = (msgId) => new Promise((resolve) => db.get("SELECT sender_id FROM messages WHERE message_id = ?",[msgId], (err, row) => resolve(row ? row.sender_id : null)));
+const getUser = (id) => new Promise((resolve) => db.get("SELECT * FROM users WHERE id = ?", [id], (err, row) => resolve(row)));
+const updateState = (id, state, partner = null) => new Promise((resolve) => db.run(`UPDATE users SET state = ?, partner_id = ? WHERE id = ?`, [state, partner, id], resolve));
+const addMessageCache = (msgId, senderId) => db.run("INSERT OR REPLACE INTO messages (message_id, sender_id) VALUES (?, ?)",[msgId, senderId]);
+const getSenderFromCache = (msgId) => new Promise((resolve) => db.get("SELECT sender_id FROM messages WHERE message_id = ?", [msgId], (err, row) => resolve(row ? row.sender_id : null)));
 
-// Cek status member channel (BOT WAJIB JADI ADMIN CHANNEL)
+// Cek status member channel (Bot Wajib Jadi Admin)
 async function isMemberJoined(userId) {
     try {
         const chatMember = await bot.getChatMember(CHANNEL_IKLAN, userId);
-        return['member', 'administrator', 'creator'].includes(chatMember.status);
+        return ['member', 'administrator', 'creator'].includes(chatMember.status);
     } catch (e) {
         return false;
     }
 }
 
+// ==========================================
+// FUNGSI PESAN BOT (DENGAN IKLAN)
+// ==========================================
 async function sendBotMessage(userId, textMsg) {
     let isMember = await isMemberJoined(userId);
     let promoText = isMember ? "" : `\n\n<i>Ikuti saluran kami agar kamu tidak mendapatkan text promosi.</i>`;
     let opts = { parse_mode: 'HTML' };
     
     if (!isMember) {
-        opts.reply_markup = {
-            inline_keyboard: [[{ text: "🚪Joint", url: CHANNEL_LINK, style: "success" }]]
-        };
+        opts.reply_markup = { inline_keyboard: [[{ text: "🚪Joint", url: CHANNEL_LINK, style: "success" }]] };
     }
     return bot.sendMessage(userId, textMsg + promoText, opts);
 }
 
+// ==========================================
+// FITUR CARI PASANGAN
+// ==========================================
 async function findPartner(userId) {
-    db.get("SELECT id FROM users WHERE state = 'searching' AND id != ? LIMIT 1",[userId], async (err, partner) => {
+    db.get("SELECT id FROM users WHERE state = 'searching' AND id != ? LIMIT 1", [userId], async (err, partner) => {
         if (partner) {
+            // Jika ketemu, pasangkan keduanya
             await updateState(userId, 'chatting', partner.id);
             await updateState(partner.id, 'chatting', userId);
             sendBotMessage(userId, "🎉 Pasangan ditemukan! Silakan mulai mengobrol.");
             sendBotMessage(partner.id, "🎉 Pasangan ditemukan! Silakan mulai mengobrol.");
+        } else {
+            // Jika kosong/belum ada pasangan yang standby
+            sendBotMessage(userId, "❌Pasangan Belum Di Temukan Gunakan /refer Agar Pasangan Cepat Di Temukan Dan Akunmu Menjadi Premium");
         }
     });
 }
 
+// ==========================================
+// LISTENER PESAN UTAMA
+// ==========================================
 bot.on('message', async (msg) => {
     const chatId = msg.chat.id;
     const text = msg.text || '';
 
-    // LOGIKA USER BARU (Untuk Mencegah Spam Referral Akun Lama)
     let user = await getUser(chatId);
     let isNewUser = false;
+    
     if (!user) {
         db.run("INSERT INTO users (id) VALUES (?)", [chatId]);
         user = { id: chatId, state: 'idle', warnings: 0, ban_until: 0, referrals: 0, premium_until: 0 };
-        isNewUser = true; // Tandai bahwa ini benar-benar user yang baru pertama kali main bot
+        isNewUser = true;
     }
 
     if (user.ban_until > Date.now()) {
@@ -88,10 +105,24 @@ bot.on('message', async (msg) => {
         return sendBotMessage(chatId, `❌ Anda sedang diblokir dari bot hingga:\n${date}`);
     }
 
+    // COMMANDS
+    if (text === '/stats') {
+        db.get("SELECT COUNT(*) AS total FROM users", (err, rowTotal) => {
+            db.get("SELECT COUNT(*) AS online FROM users WHERE state != 'idle'", (err, rowOnline) => {
+                let totalUsers = rowTotal ? rowTotal.total : 0;
+                let onlineUsers = rowOnline ? rowOnline.online : 0;
+                
+                let statsMsg = `📊 <b>Statistik Penggunaan Bot</b>\n\n👥 Total Pengguna: <b>${totalUsers} User</b>\n🟢 Sedang Online: <b>${onlineUsers} User</b>\n\n<i>*Online = Sedang mencari atau mengobrol</i>`;
+                sendBotMessage(chatId, statsMsg);
+            });
+        });
+        return;
+    }
+
     if (text.startsWith('/start') || text.startsWith('/search')) {
         let refId = text.split(' ')[1];
         
-        // HANYA berikan referral JIKA ini user baru (isNewUser)
+        // Anti Curang Referral (Hanya user baru yang dihitung)
         if (refId && refId != chatId && isNewUser) {
             let referrer = await getUser(refId);
             if (referrer) {
@@ -103,7 +134,7 @@ bot.on('message', async (msg) => {
                 else if (newRef >= 400) addDays = 365;
                 
                 let premUntil = addDays > 0 ? Date.now() + (addDays * 24 * 60 * 60 * 1000) : referrer.premium_until;
-                db.run("UPDATE users SET referrals = ?, premium_until = ? WHERE id = ?",[newRef, premUntil, refId]);
+                db.run("UPDATE users SET referrals = ?, premium_until = ? WHERE id = ?", [newRef, premUntil, refId]);
                 sendBotMessage(refId, `🎉 Kamu mendapatkan refferal baru! Total refferal: ${newRef}`);
             }
         }
@@ -144,7 +175,8 @@ bot.on('message', async (msg) => {
         const botInfo = await bot.getMe();
         const refLink = `https://t.me/${botInfo.username}?start=${chatId}`;
         const isPremium = user.premium_until > Date.now();
-        const stat = `<b>Tautan Undangan Kamu:</b>\n${refLink}\n\nTotal Refferal: ${user.referrals}\nStatus Premium: ${isPremium ? 'Aktif ✅' : 'Tidak Aktif ❌'}`;
+        // Menggunakan <code> agar link bisa diklik 1x langsung tersalin otomatis
+        const stat = `<b>Tautan Undangan Kamu:</b>\n<i>(Klik teks link di bawah untuk otomatis menyalin)</i>\n\n<code>${refLink}</code>\n\nTotal Refferal: ${user.referrals}\nStatus Premium: ${isPremium ? 'Aktif ✅' : 'Tidak Aktif ❌'}`;
         return sendBotMessage(chatId, stat);
     }
 
@@ -163,12 +195,16 @@ bot.on('message', async (msg) => {
         return sendBotMessage(chatId, "✅ Laporan berhasil dikirim ke Admin.");
     }
 
-    // PENGIRIMAN PESAN
+    // ==========================================
+    // SISTEM PENGIRIMAN PESAN ANTAR USER
+    // ==========================================
     if (user.state === 'chatting' && user.partner_id) {
         const isPremium = user.premium_until > Date.now();
+        
         if (!isPremium && text && /[@\.,!]/.test(text)) {
             return sendBotMessage(chatId, "❌ Anda bukan pengguna premium. Tidak dapat mengirim simbol larangan (@, ., ,, !) untuk menghindari encoding ID/Username.");
         }
+        
         try {
             if (text) bot.sendChatAction(user.partner_id, 'typing');
             else if (msg.photo) bot.sendChatAction(user.partner_id, 'upload_photo');
@@ -180,13 +216,15 @@ bot.on('message', async (msg) => {
             addMessageCache(sentMsg.message_id, chatId);
         } catch (e) {
             await updateState(chatId, 'idle');
-            sendBotMessage(chatId, "❌ Gagal mengirim pesan. Obrolan dihentikan.");
+            sendBotMessage(chatId, "❌ Gagal mengirim pesan. Obrolan dihentikan (Mungkin partner telah memblokir bot).");
         }
     }
 });
 
+// ==========================================
+// CALLBACK ADMIN (ACC/REJECT LOGS)
+// ==========================================
 bot.on('callback_query', async (query) => {
-    //[Sama seperti sebelumnya untuk fitur ACC/REJECT Admin]
     const data = query.data;
     const adminChatId = query.message.chat.id;
     const msgId = query.message.message_id;
@@ -201,7 +239,7 @@ bot.on('callback_query', async (query) => {
                 let newWarnings = suspect.warnings + 1;
                 let banDuration = (newWarnings === 1) ? 86400000 : (newWarnings === 2) ? 604800000 : (newWarnings === 3) ? 2592000000 : 31536000000; 
                 let banUntil = Date.now() + banDuration;
-                db.run("UPDATE users SET warnings = ?, ban_until = ?, state = 'idle' WHERE id = ?",[newWarnings, banUntil, suspectId]);
+                db.run("UPDATE users SET warnings = ?, ban_until = ?, state = 'idle' WHERE id = ?", [newWarnings, banUntil, suspectId]);
                 
                 if (suspect.state === 'chatting' && suspect.partner_id) {
                     await updateState(suspect.partner_id, 'idle');
@@ -214,10 +252,21 @@ bot.on('callback_query', async (query) => {
     }
 });
 
+// ==========================================
+// CRON JOB: BACKUP DB KE GITHUB (JAM 00:00)
+// ==========================================
 cron.schedule('0 0 * * *', () => {
+    console.log("[CRON] Menjalankan pembersihan cache & backup otomatis...");
     db.run("DELETE FROM messages");
-    // Gunakan konfigurasi git push yang sudah mem-bypass password
     exec('git add bot.db && git commit -m "Auto backup database harian" && git push origin main', (error, stdout, stderr) => {
-        if (error) console.error("Backup Github Gagal");
+        if (error) {
+            console.error(`[CRON] Backup Github Gagal: ${error.message}`);
+            bot.sendMessage(LOGS_GROUP, "⚠️ Gagal melakukan backup database otomatis ke Github.");
+            return;
+        }
+        console.log(`[CRON] Backup berhasil: ${stdout}`);
+        bot.sendMessage(LOGS_GROUP, "✅ Berhasil melakukan backup database otomatis ke Github.");
     });
 });
+
+console.log("Bot Anonim Berjalan dan Terhubung dengan Database...");
