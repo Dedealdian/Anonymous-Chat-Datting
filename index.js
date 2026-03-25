@@ -52,7 +52,7 @@ db.serialize(() => {
 const pendingCaptchas = new Map();
 
 const getUser = (id) => new Promise((resolve) => db.get("SELECT * FROM users WHERE id = ?",[id], (err, row) => resolve(row)));
-const updateState = (id, state, partner = null) => new Promise((resolve) => db.run(`UPDATE users SET state = ?, partner_id = ? WHERE id = ?`, [state, partner, id], resolve));
+const updateState = (id, state, partner = null) => new Promise((resolve) => db.run(`UPDATE users SET state = ?, partner_id = ? WHERE id = ?`,[state, partner, id], resolve));
 const addMessageCache = (msgId, senderId) => db.run("INSERT OR REPLACE INTO messages (message_id, sender_id) VALUES (?, ?)",[msgId, senderId]);
 const getSenderFromCache = (msgId) => new Promise((resolve) => db.get("SELECT sender_id FROM messages WHERE message_id = ?", [msgId], (err, row) => resolve(row ? row.sender_id : null)));
 
@@ -324,6 +324,9 @@ Kekurangan: <b>${target !== "Max" ? `Butuh ${target} referral lagi untuk level $
             await updateState(chatId, 'idle');
             sendBotMessage(chatId, "❌ Gagal mengirim pesan. Obrolan dihentikan (Mungkin partner memblokir bot).");
         }
+    } else if (!text.startsWith('/')) {
+        // FITUR BARU: Mencegah bot terasa "Stuck" jika user sedang tidak berada di obrolan
+        return sendBotMessage(chatId, "⚠️ Kamu belum berada di dalam obrolan.\n\nSilakan klik /start untuk mulai mencari pasangan.");
     }
 });
 
