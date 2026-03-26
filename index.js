@@ -131,6 +131,12 @@ async function startSearch(chatId) {
 // EVENT LISTENER PESAN MASUK
 // ==========================================
 bot.on('message', async (msg) => {
+    // FITUR ANTI-GRUP: Abaikan 100% jika pesan berasal dari Grup / Supergroup / Channel
+    // Bot hanya akan merespon jika chat bertipe 'private' (Japri/PM)
+    if (msg.chat.type !== 'private') {
+        return; 
+    }
+
     const chatId = msg.chat.id;
     const text = msg.text || '';
 
@@ -325,7 +331,7 @@ Kekurangan: <b>${target !== "Max" ? `Butuh ${target} referral lagi untuk level $
             sendBotMessage(chatId, "❌ Gagal mengirim pesan. Obrolan dihentikan (Mungkin partner memblokir bot).");
         }
     } else if (!text.startsWith('/')) {
-        // FITUR BARU: Mencegah bot terasa "Stuck" jika user sedang tidak berada di obrolan
+        // Mencegah bot terasa "Stuck" jika user sedang tidak berada di obrolan
         return sendBotMessage(chatId, "⚠️ Kamu belum berada di dalam obrolan.\n\nSilakan klik /start untuk mulai mencari pasangan.");
     }
 });
@@ -374,7 +380,7 @@ bot.on('callback_query', async (query) => {
 
     if (data.startsWith('age_')) {
         let age = data.split('_')[1];
-        db.run("UPDATE users SET age = ? WHERE id = ?", [age, queryChatId]);
+        db.run("UPDATE users SET age = ? WHERE id = ?",[age, queryChatId]);
         
         await bot.editMessageText("✅ Identitas berhasil disimpan!", { chat_id: queryChatId, message_id: msgId }).catch(()=>{});
         return startSearch(queryChatId);
